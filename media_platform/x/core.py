@@ -83,6 +83,7 @@ class XCrawler(AbstractCrawler):
 
             # 创建 API 客户端
             self.x_client = await self.create_x_client(httpx_proxy_format)
+            self.x_client.set_browser_context(self.browser_context)
             if not await self.x_client.pong():
                 login_obj = XLogin(
                     login_type=config.LOGIN_TYPE,
@@ -110,7 +111,8 @@ class XCrawler(AbstractCrawler):
         """关键词搜索推文"""
         utils.logger.info("[XCrawler] 开始搜索推文...")
         keywords = config.KEYWORDS.split(",")
-        search_filter = SearchFilter.LATEST.value
+        search_filter = getattr(config, "X_SEARCH_FILTER", SearchFilter.LATEST.value)
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
 
         for keyword in keywords:
             keyword = keyword.strip()
@@ -133,14 +135,24 @@ class XCrawler(AbstractCrawler):
                         utils.logger.info(f"[XCrawler] 关键词 '{keyword}' 无更多结果")
                         break
 
+                    # 顺序存储推文，收集需要获取评论的 tweet_id
+                    tweet_ids_for_comments = []
                     for raw_tweet in tweets:
                         tweet_data = extract_tweet_data(raw_tweet)
                         tweet_data["source_keyword"] = keyword
                         await x_store.update_x_tweet(tweet_data)
-
-                        # 获取评论
                         if config.ENABLE_GET_COMMENTS and tweet_data.get("tweet_id"):
-                            await self._get_tweet_comments(tweet_data["tweet_id"])
+                            tweet_ids_for_comments.append(tweet_data["tweet_id"])
+
+                    # 并发获取评论
+                    if tweet_ids_for_comments:
+                        comment_tasks = [
+                            asyncio.create_task(
+                                self._get_tweet_comments_task(tid, semaphore)
+                            )
+                            for tid in tweet_ids_for_comments
+                        ]
+                        await asyncio.gather(*comment_tasks)
 
                     if not next_cursor:
                         break
@@ -164,24 +176,32 @@ class XCrawler(AbstractCrawler):
             utils.logger.warning("[XCrawler] 未指定推文 URL 列表")
             return
 
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+
+        # 解析所有 URL
+        tweet_ids = []
         for url_or_id in tweet_urls:
             tweet_info = parse_tweet_url(url_or_id)
-            tweet_id = tweet_info.tweet_id if tweet_info else url_or_id
+            tweet_ids.append(tweet_info.tweet_id if tweet_info else url_or_id)
 
-            try:
-                result = await self.x_client.get_tweet_detail(tweet_id)
-                raw_tweet = self._parse_tweet_detail(result)
-                if raw_tweet:
-                    tweet_data = extract_tweet_data(raw_tweet)
-                    await x_store.update_x_tweet(tweet_data)
+        # 并发获取推文详情
+        detail_tasks = [
+            asyncio.create_task(self._get_tweet_detail_task(tid, semaphore))
+            for tid in tweet_ids
+        ]
+        tweet_results = await asyncio.gather(*detail_tasks)
 
-                    if config.ENABLE_GET_COMMENTS:
-                        await self._get_tweet_comments(tweet_id)
-
-            except Exception as e:
-                utils.logger.error(f"[XCrawler] 获取推文 {tweet_id} 失败: {e}")
-
-            await asyncio.sleep(random.uniform(1, 3))
+        # 并发获取评论
+        if config.ENABLE_GET_COMMENTS:
+            comment_tasks = [
+                asyncio.create_task(
+                    self._get_tweet_comments_task(td["tweet_id"], semaphore)
+                )
+                for td in tweet_results
+                if td and td.get("tweet_id")
+            ]
+            if comment_tasks:
+                await asyncio.gather(*comment_tasks)
 
     async def get_creators_and_tweets(self) -> None:
         """获取创作者信息和推文"""
@@ -281,15 +301,71 @@ class XCrawler(AbstractCrawler):
         )
         return browser_context
 
+    async def _get_tweet_detail_task(
+        self, tweet_id: str, semaphore: asyncio.Semaphore, keyword: str = ""
+    ) -> Optional[Dict]:
+        """获取单条推文详情（并发任务）"""
+        async with semaphore:
+            try:
+                result = await self.x_client.get_tweet_detail(tweet_id)
+                raw_tweet = self._parse_tweet_detail(result)
+                if raw_tweet:
+                    tweet_data = extract_tweet_data(raw_tweet)
+                    if keyword:
+                        tweet_data["source_keyword"] = keyword
+                    await x_store.update_x_tweet(tweet_data)
+                    return tweet_data
+            except Exception as e:
+                utils.logger.error(f"[XCrawler] 获取推文 {tweet_id} 失败: {e}")
+            finally:
+                await asyncio.sleep(random.uniform(1, 3))
+            return None
+
+    async def _get_tweet_comments_task(
+        self, tweet_id: str, semaphore: asyncio.Semaphore
+    ) -> None:
+        """获取推文评论（并发任务）"""
+        async with semaphore:
+            await self._get_tweet_comments(tweet_id)
+
     async def _get_tweet_comments(self, tweet_id: str) -> None:
-        """获取推文评论（回复）"""
-        try:
-            result = await self.x_client.get_tweet_detail(tweet_id)
-            comments = self._parse_tweet_comments(result, tweet_id)
-            for comment_data in comments[:config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES]:
-                await x_store.update_x_tweet_comment(tweet_id, comment_data)
-        except Exception as e:
-            utils.logger.error(f"[XCrawler] 获取推文 {tweet_id} 评论失败: {e}")
+        """获取推文评论（回复），支持分页"""
+        max_comments = config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES
+        all_count = 0
+        cursor = None
+
+        while all_count < max_comments:
+            try:
+                result = await self.x_client.get_tweet_detail(tweet_id, cursor=cursor)
+                comments, next_cursor = self._parse_tweet_comments(result, tweet_id)
+
+                if not comments:
+                    break
+
+                remaining = max_comments - all_count
+                batch = comments[:remaining]
+
+                for comment_data in batch:
+                    await x_store.update_x_tweet_comment(tweet_id, comment_data)
+
+                all_count += len(batch)
+                utils.logger.info(
+                    f"[XCrawler] 推文 {tweet_id} 已获取 {all_count} 条评论"
+                )
+
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+                await asyncio.sleep(random.uniform(1, 3))
+
+            except RetryError:
+                utils.logger.error(
+                    f"[XCrawler] 获取推文 {tweet_id} 评论重试次数耗尽"
+                )
+                break
+            except Exception as e:
+                utils.logger.error(f"[XCrawler] 获取推文 {tweet_id} 评论失败: {e}")
+                break
 
     def _parse_search_result(self, result: Dict) -> tuple:
         """解析搜索结果，返回 (tweets, next_cursor)"""
@@ -349,9 +425,10 @@ class XCrawler(AbstractCrawler):
             utils.logger.error(f"[XCrawler] 解析推文详情失败: {e}")
         return None
 
-    def _parse_tweet_comments(self, result: Dict, focal_tweet_id: str) -> List[Dict]:
-        """从推文详情响应中提取评论（回复）"""
+    def _parse_tweet_comments(self, result: Dict, focal_tweet_id: str) -> tuple:
+        """从推文详情响应中提取评论（回复），返回 (comments, next_cursor)"""
         comments = []
+        next_cursor = None
         try:
             instructions = (
                 result.get("data", {})
@@ -362,8 +439,16 @@ class XCrawler(AbstractCrawler):
                 entries = instruction.get("entries", [])
                 for entry in entries:
                     content = entry.get("content", {})
+                    entry_type = content.get("entryType", "")
+
                     # 跳过焦点推文本身
                     if f"tweet-{focal_tweet_id}" in entry.get("entryId", ""):
+                        continue
+
+                    # 提取分页 cursor
+                    if entry_type == "TimelineTimelineCursor":
+                        if content.get("cursorType") in ("Bottom", "ShowMore"):
+                            next_cursor = content.get("value")
                         continue
 
                     # 处理单条回复
@@ -372,22 +457,34 @@ class XCrawler(AbstractCrawler):
                         .get("tweet_results", {})
                         .get("result", {})
                     )
-                    if tweet_result and tweet_result.get("__typename") == "Tweet":
-                        comment_data = extract_tweet_data(tweet_result)
-                        comments.append(comment_data)
+                    if tweet_result:
+                        unwrapped = self._unwrap_tweet_result(tweet_result)
+                        if unwrapped:
+                            comments.append(extract_tweet_data(unwrapped))
 
                     # 处理对话线程中的回复
                     items = content.get("items", [])
                     for item in items:
                         item_content = item.get("item", {}).get("itemContent", {})
                         tweet_result = item_content.get("tweet_results", {}).get("result", {})
-                        if tweet_result and tweet_result.get("__typename") == "Tweet":
-                            comment_data = extract_tweet_data(tweet_result)
-                            comments.append(comment_data)
+                        if tweet_result:
+                            unwrapped = self._unwrap_tweet_result(tweet_result)
+                            if unwrapped:
+                                comments.append(extract_tweet_data(unwrapped))
 
         except Exception as e:
             utils.logger.error(f"[XCrawler] 解析评论失败: {e}")
-        return comments
+        return comments, next_cursor
+
+    @staticmethod
+    def _unwrap_tweet_result(tweet_result: Dict) -> Optional[Dict]:
+        """解包推文结果，处理 TweetWithVisibilityResults 类型"""
+        typename = tweet_result.get("__typename", "")
+        if typename == "Tweet":
+            return tweet_result
+        elif typename == "TweetWithVisibilityResults":
+            return tweet_result.get("tweet")
+        return None
 
     def _parse_timeline_result(self, result: Dict) -> tuple:
         """解析用户时间线结果"""

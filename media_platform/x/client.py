@@ -6,12 +6,19 @@ X (Twitter) API 客户端
 
 import asyncio
 import json
+import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import httpx
 from playwright.async_api import BrowserContext, Page
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_fixed,
+)
 
 import config
 from base.base_crawler import AbstractApiClient
@@ -80,6 +87,13 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
         self.init_proxy_pool(proxy_ip_pool)
+        # Rate limit tracking
+        self._rate_limit_remaining: Optional[int] = None
+        self._rate_limit_reset: Optional[float] = None
+        self._request_count: int = 0
+        # Cookie auto-refresh
+        self._cookie_refresh_interval: int = 50
+        self._browser_context: Optional[BrowserContext] = None
 
     async def _pre_headers(self, url: str, data=None) -> Dict:
         """构造请求头，包含 Bearer Token 和 CSRF Token"""
@@ -97,18 +111,73 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         return headers
 
     async def request(self, method, url, **kwargs) -> Any:
-        """发送 HTTP 请求"""
+        """发送 HTTP 请求，包含速率限制检测和自动退避"""
+        await self._refresh_proxy_if_expired()
         async with make_async_client(proxy=self.proxy, timeout=self.timeout) as client:
             headers = await self._pre_headers(url)
             cookies = {k: v for k, v in self.cookie_dict.items()}
             response = await client.request(
                 method, url, headers=headers, cookies=cookies, **kwargs
             )
+            self._request_count += 1
+            self._update_rate_limit_from_headers(response.headers)
+
             if response.status_code == 429:
-                raise RateLimitError(f"Rate limited: {url}")
+                wait_seconds = self._calc_rate_limit_wait()
+                utils.logger.warning(
+                    f"[XClient] Rate limited on {url}, waiting {wait_seconds:.0f}s"
+                )
+                raise RateLimitError(f"Rate limited: {url}, wait={wait_seconds:.0f}s")
+
             response.raise_for_status()
-            data = response.json()
-            return data
+            await self._maybe_slow_down()
+            await self._maybe_refresh_cookies()
+            return response.json()
+
+    def set_browser_context(self, browser_context: BrowserContext) -> None:
+        """设置浏览器上下文，用于 Cookie 自动刷新"""
+        self._browser_context = browser_context
+
+    def _update_rate_limit_from_headers(self, headers) -> None:
+        """从响应头解析速率限制信息"""
+        remaining = headers.get("x-rate-limit-remaining")
+        reset = headers.get("x-rate-limit-reset")
+        if remaining is not None:
+            self._rate_limit_remaining = int(remaining)
+        if reset is not None:
+            self._rate_limit_reset = float(reset)
+
+    def _calc_rate_limit_wait(self) -> float:
+        """计算速率限制等待时间"""
+        if self._rate_limit_reset:
+            return max(self._rate_limit_reset - time.time(), 5.0)
+        return 60.0
+
+    async def _maybe_slow_down(self) -> None:
+        """当剩余配额不足时主动休眠"""
+        if (self._rate_limit_remaining is not None
+                and self._rate_limit_remaining < 5
+                and self._rate_limit_reset):
+            wait = self._rate_limit_reset - time.time()
+            if wait > 0:
+                utils.logger.warning(
+                    f"[XClient] Rate limit low ({self._rate_limit_remaining} remaining), "
+                    f"sleeping {wait:.0f}s"
+                )
+                await asyncio.sleep(min(wait, 300))
+
+    async def _maybe_refresh_cookies(self) -> None:
+        """基于请求计数自动刷新 Cookie"""
+        if (self._request_count > 0
+                and self._request_count % self._cookie_refresh_interval == 0
+                and self._browser_context):
+            utils.logger.info(
+                f"[XClient] Auto-refreshing cookies after {self._request_count} requests"
+            )
+            try:
+                await self.update_cookies(self._browser_context)
+            except Exception as e:
+                utils.logger.warning(f"[XClient] Cookie refresh failed: {e}")
 
     async def update_cookies(self, browser_context: BrowserContext):
         """从浏览器上下文更新 Cookie"""
@@ -132,7 +201,11 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         query_id = GRAPHQL_QUERIES.get(operation_name, "")
         return f"{self._graphql_host}/{query_id}/{operation_name}"
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=4, max=120),
+        retry=retry_if_exception_type((RateLimitError, httpx.TimeoutException)),
+    )
     async def search_tweets(
         self, keyword: str, cursor: str = None, count: int = 20, search_filter: str = "Latest"
     ) -> Dict:
@@ -162,8 +235,12 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         }
         return await self.request("GET", url, params=params)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-    async def get_tweet_detail(self, tweet_id: str) -> Dict:
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=4, max=120),
+        retry=retry_if_exception_type((RateLimitError, httpx.TimeoutException)),
+    )
+    async def get_tweet_detail(self, tweet_id: str, cursor: str = None) -> Dict:
         """获取推文详情"""
         url = self._build_graphql_url("TweetDetail")
         variables = {
@@ -176,13 +253,19 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
             "withVoice": True,
             "withV2Timeline": True,
         }
+        if cursor:
+            variables["cursor"] = cursor
         params = {
             "variables": json.dumps(variables),
             "features": json.dumps(DEFAULT_FEATURES),
         }
         return await self.request("GET", url, params=params)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=4, max=120),
+        retry=retry_if_exception_type((RateLimitError, httpx.TimeoutException)),
+    )
     async def get_user_info(self, username: str) -> Dict:
         """通过用户名获取用户信息"""
         url = self._build_graphql_url("UserByScreenName")
@@ -196,7 +279,11 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         }
         return await self.request("GET", url, params=params)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=4, max=120),
+        retry=retry_if_exception_type((RateLimitError, httpx.TimeoutException)),
+    )
     async def get_user_tweets(self, user_id: str, cursor: str = None, count: int = 20) -> Dict:
         """获取用户推文列表"""
         url = self._build_graphql_url("UserTweets")
