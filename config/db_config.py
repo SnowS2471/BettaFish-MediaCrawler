@@ -1,31 +1,22 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2025 relakkes@gmail.com
-#
-# This file is part of MediaCrawler project.
-# Repository: https://github.com/NanmiCoder/MediaCrawler/blob/main/config/db_config.py
-# GitHub: https://github.com/NanmiCoder
-# Licensed under NON-COMMERCIAL LEARNING LICENSE 1.1
-#
-
-# 声明：本代码仅供学习和研究目的使用。使用者应遵守以下原则：
-# 1. 不得用于任何商业用途。
-# 2. 使用时应遵守目标平台的使用条款和robots.txt规则。
-# 3. 不得进行大规模爬取或对平台造成运营干扰。
-# 4. 应合理控制请求频率，避免给目标平台带来不必要的负担。
+# 声明：本代码仅供学习和研究目的使用。使用者应遵守以下原则：  
+# 1. 不得用于任何商业用途。  
+# 2. 使用时应遵守目标平台的使用条款和robots.txt规则。  
+# 3. 不得进行大规模爬取或对平台造成运营干扰。  
+# 4. 应合理控制请求频率，避免给目标平台带来不必要的负担。   
 # 5. 不得用于任何非法或不当的用途。
-#
-# 详细许可条款请参阅项目根目录下的LICENSE文件。
-# 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
+#   
+# 详细许可条款请参阅项目根目录下的LICENSE文件。  
+# 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。  
 
 
 import os
 
-# mysql config
-MYSQL_DB_PWD = os.getenv("MYSQL_DB_PWD", "123456")
-MYSQL_DB_USER = os.getenv("MYSQL_DB_USER", "root")
-MYSQL_DB_HOST = os.getenv("MYSQL_DB_HOST", "localhost")
-MYSQL_DB_PORT = os.getenv("MYSQL_DB_PORT", 3306)
-MYSQL_DB_NAME = os.getenv("MYSQL_DB_NAME", "media_crawler")
+# mysql config - 使用MindSpider的数据库配置
+MYSQL_DB_PWD = "snow"
+MYSQL_DB_USER = "postgres"
+MYSQL_DB_HOST = "localhost"
+MYSQL_DB_PORT = 5432
+MYSQL_DB_NAME = "BettaFish"
 
 mysql_db_config = {
     "user": MYSQL_DB_USER,
@@ -37,7 +28,7 @@ mysql_db_config = {
 
 
 # redis config
-REDIS_DB_HOST = os.getenv("REDIS_DB_HOST", "127.0.0.1")  # your redis host
+REDIS_DB_HOST = "127.0.0.1"  # your redis host
 REDIS_DB_PWD = os.getenv("REDIS_DB_PWD", "123456")  # your redis password
 REDIS_DB_PORT = os.getenv("REDIS_DB_PORT", 6379)  # your redis port
 REDIS_DB_NUM = os.getenv("REDIS_DB_NUM", 0)  # your redis db num
@@ -68,12 +59,12 @@ mongodb_config = {
     "db_name": MONGODB_DB_NAME,
 }
 
-# postgres config
-POSTGRES_DB_PWD = os.getenv("POSTGRES_DB_PWD", "123456")
+# postgres config - 使用MindSpider的数据库配置（如果DB_DIALECT是postgresql）或环境变量
+POSTGRES_DB_PWD = os.getenv("POSTGRES_DB_PWD", "snow")
 POSTGRES_DB_USER = os.getenv("POSTGRES_DB_USER", "postgres")
 POSTGRES_DB_HOST = os.getenv("POSTGRES_DB_HOST", "localhost")
-POSTGRES_DB_PORT = os.getenv("POSTGRES_DB_PORT", 5432)
-POSTGRES_DB_NAME = os.getenv("POSTGRES_DB_NAME", "media_crawler")
+POSTGRES_DB_PORT = os.getenv("POSTGRES_DB_PORT", "5432")
+POSTGRES_DB_NAME = os.getenv("POSTGRES_DB_NAME", "BettaFish")
 
 postgres_db_config = {
     "user": POSTGRES_DB_USER,
@@ -82,3 +73,4 @@ postgres_db_config = {
     "port": POSTGRES_DB_PORT,
     "db_name": POSTGRES_DB_NAME,
 }
+
