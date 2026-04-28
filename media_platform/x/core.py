@@ -6,6 +6,7 @@ X (Twitter) 爬虫核心逻辑
 import asyncio
 import os
 import random
+import re
 from asyncio import Task
 from typing import Dict, List, Optional
 
@@ -26,7 +27,7 @@ from tools import utils
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
-from .client import XClient
+from .client import XClient, GRAPHQL_QUERIES
 from .exception import DataFetchError
 from .field import SearchFilter, TweetUrlInfo, CreatorUrlInfo
 from .help import parse_tweet_url, parse_creator_url, extract_tweet_data
@@ -50,6 +51,49 @@ class XCrawler(AbstractCrawler):
         self.ip_proxy_pool = None
 
     async def start(self) -> None:
+        # 检查是否启用官方 API 模式
+        use_official = getattr(config, "X_USE_OFFICIAL_API", False)
+        bearer_token = getattr(config, "X_OFFICIAL_BEARER_TOKEN", "")
+
+        if use_official and bearer_token:
+            try:
+                await self._start_official_api()
+                return
+            except Exception as e:
+                if getattr(config, "X_OFFICIAL_API_FALLBACK", True):
+                    utils.logger.warning(
+                        f"[XCrawler] 官方 API 失败 ({e})，回退到 GraphQL 模式"
+                    )
+                else:
+                    raise
+
+        await self._start_graphql()
+
+    async def _start_official_api(self) -> None:
+        """使用官方 X API v2 (tweepy) 进行爬取"""
+        from .official_client import XOfficialClient
+
+        utils.logger.info("[XCrawler] 使用官方 X API v2 模式")
+        client = XOfficialClient(
+            bearer_token=config.X_OFFICIAL_BEARER_TOKEN,
+            api_tier=getattr(config, "X_API_TIER", "basic"),
+        )
+
+        crawler_type_var.set(config.CRAWLER_TYPE)
+
+        if config.CRAWLER_TYPE == "search":
+            await self._search_official(client)
+        elif config.CRAWLER_TYPE == "detail":
+            await self._get_specified_tweets_official(client)
+        elif config.CRAWLER_TYPE == "creator":
+            await self._get_creators_and_tweets_official(client)
+        else:
+            utils.logger.error(f"[XCrawler] 不支持的爬取类型: {config.CRAWLER_TYPE}")
+
+        utils.logger.info("[XCrawler] X 平台爬取完成 (官方 API)")
+
+    async def _start_graphql(self) -> None:
+        """使用 GraphQL + 浏览器模式进行爬取（原有逻辑）"""
         playwright_proxy_format, httpx_proxy_format = None, None
         if config.ENABLE_IP_PROXY:
             self.ip_proxy_pool = await create_ip_pool(
@@ -108,10 +152,9 @@ class XCrawler(AbstractCrawler):
             utils.logger.info("[XCrawler] X 平台爬取完成")
 
     async def search(self) -> None:
-        """关键词搜索推文"""
-        utils.logger.info("[XCrawler] 开始搜索推文...")
+        """关键词搜索推文 — 通过浏览器导航 + 拦截响应实现"""
+        utils.logger.info("[XCrawler] 开始搜索推文（浏览器拦截模式）...")
         keywords = config.KEYWORDS.split(",")
-        search_filter = getattr(config, "X_SEARCH_FILTER", SearchFilter.LATEST.value)
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
 
         for keyword in keywords:
@@ -122,29 +165,37 @@ class XCrawler(AbstractCrawler):
             utils.logger.info(f"[XCrawler] 搜索关键词: {keyword}")
             source_keyword_var.set(keyword)
 
+            collected_tweets = 0
+            max_tweets = config.CRAWLER_MAX_NOTES_COUNT
             page = 0
-            cursor = None
-            while page < config.CRAWLER_MAX_NOTES_COUNT // 20 + 1:
-                try:
-                    result = await self.x_client.search_tweets(
-                        keyword, cursor=cursor, search_filter=search_filter
-                    )
+
+            try:
+                # 第一页：通过浏览器导航触发搜索
+                search_url = (
+                    f"https://x.com/search?q={keyword}&src=typed_query&f=live"
+                )
+                result = await self._navigate_and_capture(
+                    search_url, "SearchTimeline"
+                )
+
+                while result and collected_tweets < max_tweets:
                     tweets, next_cursor = self._parse_search_result(result)
 
                     if not tweets:
                         utils.logger.info(f"[XCrawler] 关键词 '{keyword}' 无更多结果")
                         break
 
-                    # 顺序存储推文，收集需要获取评论的 tweet_id
                     tweet_ids_for_comments = []
                     for raw_tweet in tweets:
+                        if collected_tweets >= max_tweets:
+                            break
                         tweet_data = extract_tweet_data(raw_tweet)
                         tweet_data["source_keyword"] = keyword
                         await x_store.update_x_tweet(tweet_data)
+                        collected_tweets += 1
                         if config.ENABLE_GET_COMMENTS and tweet_data.get("tweet_id"):
                             tweet_ids_for_comments.append(tweet_data["tweet_id"])
 
-                    # 并发获取评论
                     if tweet_ids_for_comments:
                         comment_tasks = [
                             asyncio.create_task(
@@ -154,20 +205,83 @@ class XCrawler(AbstractCrawler):
                         ]
                         await asyncio.gather(*comment_tasks)
 
-                    if not next_cursor:
+                    utils.logger.info(
+                        f"[XCrawler] 关键词 '{keyword}' 已收集 {collected_tweets} 条推文"
+                    )
+
+                    if not next_cursor or collected_tweets >= max_tweets:
                         break
-                    cursor = next_cursor
+
+                    # 下一页：滚动到底部触发加载更多
+                    result = await self._scroll_and_capture("SearchTimeline")
                     page += 1
+                    await asyncio.sleep(random.uniform(2, 4))
 
-                    # 随机延迟，避免触发反爬
-                    await asyncio.sleep(random.uniform(2, 5))
+            except Exception as e:
+                utils.logger.error(f"[XCrawler] 搜索 '{keyword}' 异常: {e}")
 
-                except RetryError:
-                    utils.logger.error(f"[XCrawler] 搜索 '{keyword}' 重试次数耗尽")
+            utils.logger.info(
+                f"[XCrawler] 关键词 '{keyword}' 完成，共 {collected_tweets} 条推文"
+            )
+            await asyncio.sleep(random.uniform(1, 3))
+
+    async def _navigate_and_capture(
+        self, url: str, operation_name: str, timeout: int = 30000
+    ) -> Optional[Dict]:
+        """导航到 URL 并拦截指定 GraphQL 操作的响应"""
+        import json as _json
+
+        captured = []
+
+        async def _on_response(response):
+            req_url = response.url
+            if f"/{operation_name}" in req_url and "/i/api/graphql/" in req_url:
+                try:
+                    body = await response.json()
+                    captured.append(body)
+                except Exception:
+                    pass
+
+        self.context_page.on("response", _on_response)
+        try:
+            await self.context_page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            # 等待 GraphQL 响应到达
+            for _ in range(20):
+                if captured:
                     break
-                except Exception as e:
-                    utils.logger.error(f"[XCrawler] 搜索 '{keyword}' 异常: {e}")
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(2)  # 额外等待确保数据完整
+        finally:
+            self.context_page.remove_listener("response", _on_response)
+
+        return captured[0] if captured else None
+
+    async def _scroll_and_capture(
+        self, operation_name: str, timeout: int = 15000
+    ) -> Optional[Dict]:
+        """滚动页面触发加载更多，拦截 GraphQL 响应"""
+        captured = []
+
+        async def _on_response(response):
+            req_url = response.url
+            if f"/{operation_name}" in req_url and "/i/api/graphql/" in req_url:
+                try:
+                    body = await response.json()
+                    captured.append(body)
+                except Exception:
+                    pass
+
+        self.context_page.on("response", _on_response)
+        try:
+            await self.context_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            for _ in range(30):
+                if captured:
                     break
+                await asyncio.sleep(0.5)
+        finally:
+            self.context_page.remove_listener("response", _on_response)
+
+        return captured[0] if captured else None
 
     async def get_specified_tweets(self) -> None:
         """获取指定推文详情"""
@@ -261,6 +375,195 @@ class XCrawler(AbstractCrawler):
                 utils.logger.error(f"[XCrawler] 获取创作者 {username} 失败: {e}")
 
             await asyncio.sleep(random.uniform(1, 3))
+
+    # ------------------------------------------------------------------
+    # 官方 API 模式的爬取方法
+    # ------------------------------------------------------------------
+
+    async def _search_official(self, client) -> None:
+        """官方 API 模式：关键词搜索推文"""
+        utils.logger.info("[XCrawler] 开始搜索推文 (官方 API)...")
+        keywords = config.KEYWORDS.split(",")
+
+        for keyword in keywords:
+            keyword = keyword.strip()
+            if not keyword:
+                continue
+
+            utils.logger.info(f"[XCrawler] 搜索关键词: {keyword}")
+            source_keyword_var.set(keyword)
+
+            try:
+                tweets = await client.search_tweets(
+                    keyword, max_results=config.CRAWLER_MAX_NOTES_COUNT
+                )
+                utils.logger.info(
+                    f"[XCrawler] 关键词 '{keyword}' 获取到 {len(tweets)} 条推文"
+                )
+
+                for tweet_data in tweets:
+                    tweet_data["source_keyword"] = keyword
+                    await x_store.update_x_tweet(tweet_data)
+
+                    if config.ENABLE_GET_COMMENTS and tweet_data.get("tweet_id"):
+                        comments = await client.get_tweet_comments(
+                            tweet_data["tweet_id"],
+                            max_results=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+                        )
+                        for comment in comments:
+                            await x_store.update_x_tweet_comment(
+                                tweet_data["tweet_id"], comment
+                            )
+
+            except DataFetchError as e:
+                utils.logger.error(f"[XCrawler] 搜索 '{keyword}' 失败: {e}")
+            except Exception as e:
+                utils.logger.error(f"[XCrawler] 搜索 '{keyword}' 异常: {e}")
+
+    async def _get_specified_tweets_official(self, client) -> None:
+        """官方 API 模式：获取指定推文详情"""
+        tweet_urls = getattr(config, "X_SPECIFIED_ID_LIST", [])
+        if not tweet_urls:
+            utils.logger.warning("[XCrawler] 未指定推文 URL 列表")
+            return
+
+        for url_or_id in tweet_urls:
+            tweet_info = parse_tweet_url(url_or_id)
+            tweet_id = tweet_info.tweet_id if tweet_info else url_or_id
+
+            try:
+                tweet_data = await client.get_tweet_detail(tweet_id)
+                if tweet_data:
+                    await x_store.update_x_tweet(tweet_data)
+
+                    if config.ENABLE_GET_COMMENTS:
+                        comments = await client.get_tweet_comments(
+                            tweet_id,
+                            max_results=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+                        )
+                        for comment in comments:
+                            await x_store.update_x_tweet_comment(tweet_id, comment)
+                else:
+                    utils.logger.warning(f"[XCrawler] 推文 {tweet_id} 未找到")
+            except Exception as e:
+                utils.logger.error(f"[XCrawler] 获取推文 {tweet_id} 失败: {e}")
+
+    async def _get_creators_and_tweets_official(self, client) -> None:
+        """官方 API 模式：获取创作者信息和推文"""
+        creator_urls = getattr(config, "X_CREATOR_ID_LIST", [])
+        if not creator_urls:
+            utils.logger.warning("[XCrawler] 未指定创作者 URL 列表")
+            return
+
+        for url_or_username in creator_urls:
+            creator_info = parse_creator_url(url_or_username)
+            username = creator_info.username if creator_info else url_or_username
+
+            try:
+                creator_item = await client.get_user_info(username)
+                if not creator_item:
+                    utils.logger.warning(f"[XCrawler] 用户 {username} 未找到")
+                    continue
+
+                user_id = creator_item["user_id"]
+                await x_store.save_creator(user_id, creator_item)
+
+                tweets = await client.get_user_tweets(
+                    user_id, max_results=config.CRAWLER_MAX_NOTES_COUNT
+                )
+                for tweet_data in tweets:
+                    await x_store.update_x_tweet(tweet_data)
+
+                utils.logger.info(
+                    f"[XCrawler] 创作者 {username} 获取到 {len(tweets)} 条推文"
+                )
+            except Exception as e:
+                utils.logger.error(f"[XCrawler] 获取创作者 {username} 失败: {e}")
+
+    async def _sniff_graphql_ids(self) -> None:
+        """通过拦截浏览器真实请求，动态提取 GraphQL query ID 和 features。
+
+        原理：在浏览器中执行一次真实搜索，拦截 X 前端发出的 GraphQL 请求，
+        从 URL 中提取当前有效的 query ID，从 query string 中提取 features 参数。
+        这样 query ID 和 features 始终与 X 前端版本一致。
+        """
+        from .client import GRAPHQL_QUERIES, DEFAULT_FEATURES
+        import json
+        import urllib.parse
+
+        utils.logger.info("[XCrawler] 正在通过浏览器拦截提取最新 GraphQL 参数...")
+
+        captured: Dict[str, Dict] = {}  # op_name -> {"query_id": ..., "features": ...}
+
+        async def _on_request(request):
+            url = request.url
+            if "/i/api/graphql/" not in url:
+                return
+            # URL 格式: /i/api/graphql/{queryId}/{OperationName}?variables=...&features=...
+            match = re.search(r"/i/api/graphql/([^/]+)/([^?]+)", url)
+            if not match:
+                return
+            qid, op_name = match.group(1), match.group(2)
+            if op_name in GRAPHQL_QUERIES and op_name not in captured:
+                entry = {"query_id": qid}
+                # 提取 features 参数
+                parsed = urllib.parse.urlparse(url)
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "features" in qs:
+                    try:
+                        entry["features"] = json.loads(qs["features"][0])
+                    except (json.JSONDecodeError, IndexError):
+                        pass
+                captured[op_name] = entry
+                utils.logger.info(f"[XCrawler] 捕获到 {op_name} -> {qid}")
+
+        self.context_page.on("request", _on_request)
+
+        try:
+            # 执行一次搜索触发 SearchTimeline 请求
+            await self.context_page.goto(
+                "https://x.com/search?q=test&src=typed_query&f=live",
+                wait_until="networkidle", timeout=30000,
+            )
+            await asyncio.sleep(3)
+
+            # 访问一条推文触发 TweetDetail（可选，搜索结果里通常够用）
+            # 访问 explore 触发其他请求
+            await self.context_page.goto(
+                "https://x.com/explore", wait_until="networkidle", timeout=20000,
+            )
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            utils.logger.warning(f"[XCrawler] 浏览器导航异常（不影响已捕获的 ID）: {e}")
+        finally:
+            self.context_page.remove_listener("request", _on_request)
+
+        # 更新 query ID
+        for op_name, info in captured.items():
+            GRAPHQL_QUERIES[op_name] = info["query_id"]
+
+        # 如果捕获到了 features，用第一个捕获到的更新 DEFAULT_FEATURES
+        for op_name, info in captured.items():
+            if "features" in info:
+                DEFAULT_FEATURES.clear()
+                DEFAULT_FEATURES.update(info["features"])
+                utils.logger.info(
+                    f"[XCrawler] 已从 {op_name} 更新 features ({len(info['features'])} 项)"
+                )
+                break
+
+        if captured:
+            utils.logger.info(
+                f"[XCrawler] 成功提取 {len(captured)} 个 GraphQL 端点: "
+                + ", ".join(f"{k}={v['query_id']}" for k, v in captured.items())
+            )
+        else:
+            utils.logger.error("[XCrawler] 未能捕获到任何 GraphQL 请求，爬取可能失败")
+
+        missing = [op for op in GRAPHQL_QUERIES if not GRAPHQL_QUERIES[op]]
+        if missing:
+            utils.logger.warning(f"[XCrawler] 以下操作缺少 query ID: {missing}")
 
     async def create_x_client(self, httpx_proxy: Optional[str]) -> XClient:
         """创建 X API 客户端"""

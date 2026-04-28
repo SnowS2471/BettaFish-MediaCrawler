@@ -34,12 +34,12 @@ from .exception import DataFetchError, RateLimitError, TweetNotFoundError
 # X Web App Bearer Token (公开的，所有 Web 客户端共用)
 BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 
-# GraphQL 查询 ID 映射 (需要定期更新)
+# GraphQL 查询 ID 映射 (运行时会通过浏览器拦截自动更新)
 GRAPHQL_QUERIES = {
-    "SearchTimeline": "nK1dw4oV3k4w5TdtcAdSww",
-    "TweetDetail": "xOhkmRac04YFZDUKBNhCXg",
-    "UserByScreenName": "G3KGOASz96M-Qu0nwT_CjQ",
-    "UserTweets": "V1ze5q3ijDS1VeLwLY0m7g",
+    "SearchTimeline": "",
+    "TweetDetail": "",
+    "UserByScreenName": "",
+    "UserTweets": "",
 }
 
 # GraphQL 通用 features 参数
@@ -111,7 +111,20 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         return headers
 
     async def request(self, method, url, **kwargs) -> Any:
-        """发送 HTTP 请求，包含速率限制检测和自动退避"""
+        """通过浏览器内部 fetch() 发送请求，绕过 TLS 指纹检测。
+
+        如果浏览器 page 不可用，回退到 httpx。
+        """
+        self._request_count += 1
+
+        # 优先使用浏览器内置 fetch
+        if self.playwright_page:
+            try:
+                return await self._browser_fetch(method, url, **kwargs)
+            except Exception as e:
+                utils.logger.warning(f"[XClient] 浏览器 fetch 失败，回退 httpx: {e}")
+
+        # 回退: httpx
         await self._refresh_proxy_if_expired()
         async with make_async_client(proxy=self.proxy, timeout=self.timeout) as client:
             headers = await self._pre_headers(url)
@@ -119,7 +132,6 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
             response = await client.request(
                 method, url, headers=headers, cookies=cookies, **kwargs
             )
-            self._request_count += 1
             self._update_rate_limit_from_headers(response.headers)
 
             if response.status_code == 429:
@@ -133,6 +145,56 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
             await self._maybe_slow_down()
             await self._maybe_refresh_cookies()
             return response.json()
+
+    async def _browser_fetch(self, method, url, **kwargs) -> Any:
+        """在浏览器页面内执行 fetch()，请求与浏览器自身完全一致。"""
+        params = kwargs.get("params")
+        if params:
+            query_string = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+            url = f"{url}?{query_string}"
+
+        csrf_token = self.cookie_dict.get("ct0", "")
+
+        js_code = """
+        async ([url, method, csrfToken, bearerToken]) => {
+            const resp = await fetch(url, {
+                method: method,
+                headers: {
+                    "authorization": bearerToken,
+                    "x-csrf-token": csrfToken,
+                    "x-twitter-auth-type": "OAuth2Session",
+                    "x-twitter-active-user": "yes",
+                    "content-type": "application/json",
+                },
+                credentials: "include",
+            });
+            if (resp.status === 429) {
+                const reset = resp.headers.get("x-rate-limit-reset") || "";
+                throw new Error("RATE_LIMITED:" + reset);
+            }
+            if (!resp.ok) {
+                throw new Error("HTTP_" + resp.status + ": " + (await resp.text()).slice(0, 200));
+            }
+            return await resp.json();
+        }
+        """
+
+        try:
+            result = await self.playwright_page.evaluate(
+                js_code,
+                [url, method.upper(), csrf_token, f"Bearer {BEARER_TOKEN}"],
+            )
+            await self._maybe_slow_down()
+            await self._maybe_refresh_cookies()
+            return result
+        except Exception as e:
+            err_msg = str(e)
+            if "RATE_LIMITED" in err_msg:
+                reset_str = err_msg.split("RATE_LIMITED:")[-1]
+                if reset_str:
+                    self._rate_limit_reset = float(reset_str)
+                raise RateLimitError(f"Rate limited: {url}")
+            raise
 
     def set_browser_context(self, browser_context: BrowserContext) -> None:
         """设置浏览器上下文，用于 Cookie 自动刷新"""
