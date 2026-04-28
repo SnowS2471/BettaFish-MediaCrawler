@@ -541,3 +541,43 @@ class TwitterCreator(Base):
     tweet_count = Column(String(64), default='0', comment='推文数')
     listed_count = Column(String(64), default='0', comment='被列表数')
     profile_url = Column(Text, comment='个人主页URL')
+
+
+class SANewsArticle(Base):
+    __tablename__ = 'sa_news_article'
+    id = Column(Integer, primary_key=True, comment='主键ID')
+    article_id = Column(String(64), index=True, unique=True, nullable=False, comment='文章ID(URL哈希)')
+    source_site = Column(String(32), index=True, comment='来源站点(mg/iol/sowetan/news24/sundaytimes)')
+    title = Column(Text, comment='文章标题')
+    content = Column(Text, comment='文章正文')
+    summary = Column(Text, comment='文章摘要')
+    author = Column(String(255), comment='作者')
+    publish_time = Column(String(255), index=True, comment='发布时间')
+    article_url = Column(Text, comment='文章URL')
+    image_urls = Column(Text, comment='图片URL列表(JSON)')
+    category = Column(String(255), comment='分类')
+    tags = Column(Text, comment='标签列表(JSON)')
+    source_keyword = Column(Text, default='', comment='来源关键词')
+    add_ts = Column(BigInteger, comment='添加时间戳')
+    last_modify_ts = Column(BigInteger, comment='最后修改时间戳')
+    # 翻译字段
+    title_zh = Column(Text, comment='标题中文翻译')
+    content_zh = Column(Text, comment='正文中文翻译')
+    summary_zh = Column(Text, comment='摘要中文翻译')
+    translation_status = Column(String(16), default='pending', index=True, comment='翻译状态: pending/translating/done/failed')
+    translation_provider = Column(String(64), comment='翻译使用的模型标识')
+    translation_ts = Column(BigInteger, comment='翻译完成时间戳')
+    # 翻译成本统计
+    translation_input_tokens = Column(Integer, default=0, comment='翻译输入token数')
+    translation_output_tokens = Column(Integer, default=0, comment='翻译输出token数')
+    translation_cost = Column(String(32), comment='翻译估算费用')
+    translation_duration_ms = Column(BigInteger, comment='翻译耗时(毫秒)')
+    # 翻译评估
+    eval_accuracy = Column(Integer, comment='忠实度评分(1-10)')
+    eval_fluency = Column(Integer, comment='流畅度评分(1-10)')
+    eval_terminology = Column(Integer, comment='术语准确性评分(1-10)')
+    eval_completeness = Column(Integer, comment='完整性评分(1-10)')
+    eval_overall = Column(Integer, comment='综合评分(1-10)')
+    eval_comment = Column(Text, comment='评估简评(JSON)')
+    eval_provider = Column(String(64), comment='评估模型标识')
+    eval_ts = Column(BigInteger, comment='评估完成时间戳')
