@@ -18,13 +18,11 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 # Basic configuration
-PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
-KEYWORDS = "编程副业,编程兼职"  # Keyword search configuration, separated by English commas
+PLATFORM = "x"  # 平台，xhs | dy | ks | bili | wb | tieba | zhihu | news_za
+KEYWORDS = "南非汉坦病毒"  # 关键词搜索配置，以英文逗号分隔  Terrorist attacks in South Africa, Enterprise security in South Africa
 LOGIN_TYPE = "qrcode"  # qrcode or phone or cookie
-COOKIES = ""
-CRAWLER_TYPE = (
-    "search"  # Crawling type, search (keyword search) | detail (post details) | creator (creator homepage data)
-)
+COOKIES = "auth_token=7e8ce485091f1d6b5798410e6878438b6c453616; ct0=c6f020afdd9d26c0b939dcf8829e84f59fb484490b3099531f9139e24aa0d5d43a486dcbf195d0f39afb5c6c83c642499cab66a5c259474f86ba33b59316622ca65b0b740e0c4552b6654b52fbd0d092"
+CRAWLER_TYPE = "search"  # 爬取类型，search(关键词搜索) | detail(帖子详情)| creator(创作者主页数据)
 # Whether to enable IP proxy
 ENABLE_IP_PROXY = False
 
@@ -71,7 +69,7 @@ BROWSER_LAUNCH_TIMEOUT = 60
 AUTO_CLOSE_BROWSER = True
 
 # Data saving type option configuration, supports: csv, db, json, jsonl, sqlite, excel, postgres. It is best to save to DB, with deduplication function.
-SAVE_DATA_OPTION = "jsonl"  # csv or db or json or jsonl or sqlite or excel or postgres
+SAVE_DATA_OPTION = "postgres"  # csv or db or json or sqlite or postgres
 
 # Data saving path, if not specified by default, it will be saved to the data folder.
 SAVE_DATA_PATH = ""
@@ -83,7 +81,7 @@ USER_DATA_DIR = "%s_user_data_dir"  # %s will be replaced by platform name
 START_PAGE = 1
 
 # Control the number of crawled videos/posts
-CRAWLER_MAX_NOTES_COUNT = 15
+CRAWLER_MAX_NOTES_COUNT = 50
 
 # Controlling the number of concurrent crawlers
 MAX_CONCURRENCY_NUM = 1
@@ -95,7 +93,7 @@ ENABLE_GET_MEIDAS = False
 ENABLE_GET_COMMENTS = True
 
 # Control the number of crawled first-level comments (single video/post)
-CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 10
+CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 20
 
 # Whether to enable the mode of crawling second-level comments. By default, crawling of second-level comments is not enabled.
 # If the old version of the project uses db, you need to refer to schema/tables.sql line 287 to add table fields.
@@ -131,3 +129,5 @@ from .ks_config import *
 from .weibo_config import *
 from .tieba_config import *
 from .zhihu_config import *
+from .x_config import *
+from .news_za_config import *
