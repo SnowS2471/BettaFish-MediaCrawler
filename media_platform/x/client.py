@@ -120,7 +120,10 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
         # 优先使用浏览器内置 fetch
         if self.playwright_page:
             try:
-                return await self._browser_fetch(method, url, **kwargs)
+                result = await self._browser_fetch(method, url, **kwargs)
+                if result is not None:
+                    return result
+                utils.logger.debug(f"[XClient] 浏览器 fetch 返回空响应，回退 httpx")
             except Exception as e:
                 utils.logger.warning(f"[XClient] 浏览器 fetch 失败，回退 httpx: {e}")
 
@@ -144,6 +147,9 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
             response.raise_for_status()
             await self._maybe_slow_down()
             await self._maybe_refresh_cookies()
+            if not response.text.strip():
+                utils.logger.debug(f"[XClient] httpx 收到空响应: {url}")
+                return None
             return response.json()
 
     async def _browser_fetch(self, method, url, **kwargs) -> Any:
@@ -175,7 +181,11 @@ class XClient(AbstractApiClient, ProxyRefreshMixin):
             if (!resp.ok) {
                 throw new Error("HTTP_" + resp.status + ": " + (await resp.text()).slice(0, 200));
             }
-            return await resp.json();
+            const text = await resp.text();
+            if (!text || text.trim().length === 0) {
+                return null;
+            }
+            return JSON.parse(text);
         }
         """
 

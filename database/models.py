@@ -581,3 +581,4 @@ class SANewsArticle(Base):
     eval_comment = Column(Text, comment='评估简评(JSON)')
     eval_provider = Column(String(64), comment='评估模型标识')
     eval_ts = Column(BigInteger, comment='评估完成时间戳')
+    quality_flag = Column(String(16), comment='质量标记: good/low_quality')

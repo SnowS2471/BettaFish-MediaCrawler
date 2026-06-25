@@ -79,6 +79,42 @@ def extract_media_urls(entities: Dict) -> List[Dict]:
     return media_list
 
 
+def extract_creator_from_tweet(raw_tweet: Dict) -> Optional[Dict]:
+    """
+    从推文的 GraphQL 响应中提取嵌入的创作者信息。
+    搜索结果中每条推文都包含完整的用户 legacy 数据，
+    可直接提取为创作者记录，无需额外 API 请求。
+    """
+    core = raw_tweet.get("core", {})
+    user_results = core.get("user_results", {}).get("result", {})
+    user_legacy = user_results.get("legacy", {})
+
+    user_id = user_legacy.get("id_str", user_results.get("rest_id", ""))
+    if not user_id:
+        return None
+
+    username = user_legacy.get("screen_name", "")
+    return {
+        "user_id": user_id,
+        "username": username,
+        "nickname": user_legacy.get("name", ""),
+        "avatar": user_legacy.get("profile_image_url_https", ""),
+        "banner_url": user_legacy.get("profile_banner_url", ""),
+        "bio": user_legacy.get("description", ""),
+        "location": user_legacy.get("location", ""),
+        "website": "",
+        "join_date": user_legacy.get("created_at", ""),
+        "verified": 1 if user_results.get("is_blue_verified") else 0,
+        "verified_type": user_results.get("verified_type", ""),
+        "protected": 1 if user_legacy.get("protected") else 0,
+        "followers_count": str(user_legacy.get("followers_count", 0)),
+        "following_count": str(user_legacy.get("friends_count", 0)),
+        "tweet_count": str(user_legacy.get("statuses_count", 0)),
+        "listed_count": str(user_legacy.get("listed_count", 0)),
+        "profile_url": f"https://x.com/{username}",
+    }
+
+
 def extract_tweet_data(raw_tweet: Dict) -> Dict:
     """
     从 GraphQL 响应中提取推文数据，转换为本地数据库格式

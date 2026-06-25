@@ -18,11 +18,11 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 # Basic configuration
-PLATFORM = "news_za"  # 平台，xhs | dy | ks | bili | wb | tieba | zhihu
-KEYWORDS = "南非恐怖袭击, 南非企业安全"  # 关键词搜索配置，以英文逗号分隔
+PLATFORM = "x"  # 平台，xhs | dy | ks | bili | wb | tieba | zhihu | news_za
+KEYWORDS = "南非汉坦病毒"  # 关键词搜索配置，以英文逗号分隔  Terrorist attacks in South Africa, Enterprise security in South Africa
 LOGIN_TYPE = "qrcode"  # qrcode or phone or cookie
 COOKIES = "auth_token=7e8ce485091f1d6b5798410e6878438b6c453616; ct0=c6f020afdd9d26c0b939dcf8829e84f59fb484490b3099531f9139e24aa0d5d43a486dcbf195d0f39afb5c6c83c642499cab66a5c259474f86ba33b59316622ca65b0b740e0c4552b6654b52fbd0d092"
-CRAWLER_TYPE = "detail"  # 爬取类型，search(关键词搜索) | detail(帖子详情)| creator(创作者主页数据)
+CRAWLER_TYPE = "search"  # 爬取类型，search(关键词搜索) | detail(帖子详情)| creator(创作者主页数据)
 # Whether to enable IP proxy
 ENABLE_IP_PROXY = False
 
@@ -90,7 +90,7 @@ MAX_CONCURRENCY_NUM = 1
 ENABLE_GET_MEIDAS = False
 
 # Whether to enable comment crawling mode. Comment crawling is enabled by default.
-ENABLE_GET_COMMENTS = False
+ENABLE_GET_COMMENTS = True
 
 # Control the number of crawled first-level comments (single video/post)
 CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 20
